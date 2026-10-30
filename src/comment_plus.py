@@ -9,14 +9,13 @@ from utils import (
     extract_user_info_from_cookies,
     claim_task_reward
 )
+from auto_read import ZaimanhuaReader
 
-# 配置
 MAX_RETRIES = 3
-
-# 特殊标记：用于区分"任务跳过"和"任务成功/失败"
+COMMENT_TASK_ID = 14
 COMMENT_SKIPPED = 'skipped'
+CLIENT_ID = None
 
-# 评论内容池 (通用型支持语句)
 COMMENTS = [
     "(゜∀゜*)",
     "(⁠・⁠∀⁠・⁠)",
@@ -30,7 +29,6 @@ COMMENTS = [
 
 
 def mask_phone(phone):
-    """对手机号进行打码处理，不暴露任何数字"""
     if phone is None:
         return None
     phone_str = str(phone)
@@ -40,16 +38,8 @@ def mask_phone(phone):
 
 
 def check_user_commented(token, comic_id, uid):
-    """通过评论列表API检查用户是否已在该漫画下发表过评论
+    import html as html_lib
 
-    Args:
-        token: 用户token
-        comic_id: 漫画ID
-        uid: 用户ID
-
-    Returns:
-        bool: 是否已评论过
-    """
     try:
         url = "https://v4api.zaimanhua.com/app/v1/comment/list"
         headers = {
@@ -71,27 +61,19 @@ def check_user_commented(token, comic_id, uid):
             return False
         data = result.get("data", {})
         comment_list = data.get("commentList", {})
-        for comment in comment_list.values():
-            if comment.get("sender_uid") == uid:
-                return True
-        return False
+        comments = list(comment_list.values())
+        print(f"  漫画ID {comic_id} 评论列表（{len(comments)} 条）:")
+        for comment in comments:
+            nickname = comment.get("nickname") or comment.get("author", {}).get("nickname") or "未知用户"
+            content = html_lib.unescape(comment.get("content", "")).strip()
+            print(f"    用户名: {nickname} | 评论内容: {content}")
+        return any(comment.get("sender_uid") == uid for comment in comments)
     except Exception as e:
         print(f"  检查评论历史失败: {e}")
         return False
 
 
 def get_user_recent_comments(token, uid, days=7, max_pages=5):
-    """获取用户最近N天的往期评论内容，用于避免重复发送相同评论
-
-    Args:
-        token: 用户token
-        uid: 用户UID
-        days: 回溯天数（默认7天）
-        max_pages: 最大翻页数（每页10条，最多查50条）
-
-    Returns:
-        set: 最近使用的评论内容集合（去重后的评论文本）
-    """
     import html as html_lib
 
     recent_contents = set()
@@ -127,7 +109,7 @@ def get_user_recent_comments(token, uid, days=7, max_pages=5):
             reached_old = False
             for item in comment_list:
                 create_time = item.get("create_time", 0)
-                # 判断时间戳精度（秒或毫秒）
+                # 兼容秒和毫秒时间戳
                 if create_time > 10000000000:
                     create_time = create_time / 1000
 
@@ -138,6 +120,11 @@ def get_user_recent_comments(token, uid, days=7, max_pages=5):
                 content = html_lib.unescape(item.get("content", "")).strip()
                 if content:
                     recent_contents.add(content)
+                    entity = item.get("entity", {})
+                    comic_id = item.get("obj_id") or entity.get("id")
+                    comic_title = html_lib.unescape(entity.get("name") or "未知标题")
+                    comic_url = f"https://m.zaimanhua.com/pages/comic/detail?id={comic_id}"
+                    print(f"  漫画ID: {comic_id} | 标题: {comic_title} | 评论内容: {content} | 链接: {comic_url}")
 
             if reached_old or len(comment_list) < 10:
                 break
@@ -149,46 +136,90 @@ def get_user_recent_comments(token, uid, days=7, max_pages=5):
 
 
 def pick_unique_comment(recent_comments):
-    """从 COMMENTS 池中随机选一条，排除最近已使用过的评论
-
-    Args:
-        recent_comments: set，最近已使用的评论内容集合
-
-    Returns:
-        str: 选中的评论文本，如果全部用过了则返回随机一条（兜底）
-    """
     available = [c for c in COMMENTS if c not in recent_comments]
     if available:
         return random.choice(available)
-    # 全部都用过了，兜底：随机返回一条
+    # 全部用过后随机兜底
     return random.choice(COMMENTS)
 
 
-def send_comment_api(token, comic_id, content):
-    """通过API直接发送评论
+def get_source_comic_ids(cookie_str):
+    reader = ZaimanhuaReader(cookie_str)
+    comics = reader.get_all_source_comics()
+    comic_ids = []
+    seen_ids = set()
+    for comic in comics:
+        comic_id = comic.get("comic_id") or comic.get("id")
+        if comic_id and comic_id not in seen_ids:
+            seen_ids.add(comic_id)
+            comic_ids.append(str(comic_id))
+    print(f"  从首页、排行榜、最近更新获取到 {len(comic_ids)} 本漫画")
+    return comic_ids
 
-    Args:
-        token: 用户token
-        comic_id: 漫画ID
-        content: 评论内容
 
-    Returns:
-        (success: bool, response: dict)
-    """
+def get_comment_comic_candidates(cookie_str, user_level, max_attempts=10):
+    if user_level <= 3:
+        print("  账号等级低于lv4，从首页、排行榜、最近更新获取漫画")
+        try:
+            comic_candidates = get_source_comic_ids(cookie_str)
+        except Exception as e:
+            print(f"  获取漫画失败: {e}")
+            comic_candidates = []
+        random.shuffle(comic_candidates)
+        comic_candidates = comic_candidates[:max_attempts]
+        if not comic_candidates:
+            print("  获取漫画失败，改用随机漫画ID")
+            comic_candidates = [
+                str(random.randint(4, 89138))
+                for _ in range(max_attempts)
+            ]
+    else:
+        comic_candidates = [
+            str(random.randint(4, 89138))
+            for _ in range(max_attempts)
+        ]
+    return comic_candidates
+
+
+def get_client_id():
+    global CLIENT_ID
+    if CLIENT_ID is None:
+        try:
+            resp = requests.get("https://v4api.zaimanhua.com/app/v1/config/common", timeout=10)
+            CLIENT_ID = resp.json().get("data", {}).get("data", {}).get("clientId", "")
+        except Exception:
+            CLIENT_ID = ""
+    return CLIENT_ID
+
+
+def send_comment_api(token, comic_id, content, cookie_str=None):
     url = "https://v4api.zaimanhua.com/app/v1/comment/create"
+    user_info = extract_user_info_from_cookies(cookie_str or "")
+    client_id = str(user_info.get("uid") or get_client_id())
+    params = {
+        "platform": "android",
+        "timestamp": str(int(time.time() * 1000)),
+        "_v": "2.3.9",
+        "_c": "101_01_01_000",
+    }
     headers = {
         "Authorization": f"Bearer {token}",
+        "Accept": "*/*",
         "Content-Type": "application/json; charset=utf-8",
+        "Platform": "android",
+        "X-Client-ID": client_id,
+        "AppVersion": "2.3.9",
+        "BuildNumber": "1502292",
     }
     data = {
         "obj_id": int(comic_id),
         "to_comment_id": 0,
-        "type": 4,  # 漫画类型，AppConstant.kTypeComic
+        "type": 4,
         "content": content,
         "img": [],
     }
     try:
-        resp = requests.post(url, headers=headers, json=data, timeout=20)
+        resp = requests.post(url, headers=headers, params=params, json=data, timeout=20)
         result = resp.json()
         if result.get("errno") == 0:
             return True, result
@@ -199,18 +230,16 @@ def send_comment_api(token, comic_id, content):
 
 
 def post_daily_comment(cookie_str, bind_phone=None):
-    """发表每日评论（API直接发送版本）
-
-    Args:
-        cookie_str: Cookie字符串
-        bind_phone: 从API登录响应获取的绑定手机号（可选），如果为None则从Cookie中提取
-    """
     print("\n=== 每日评论任务 ===")
 
-    # 预检查：手机绑定状态和任务状态
     user_info = extract_user_info_from_cookies(cookie_str)
     token = user_info.get('token')
     uid = user_info.get('uid')
+    try:
+        user_level = int(user_info.get('user_level') or 0)
+    except (TypeError, ValueError):
+        user_level = 0
+    print(f"  用户等级: lv{user_level}")
 
     if token:
         print("检查当前任务状态...")
@@ -219,13 +248,12 @@ def post_daily_comment(cookie_str, bind_phone=None):
             tasks = extract_tasks_from_response(task_result)
             for task in tasks:
                 task_id = task.get('id') or task.get('taskId')
-                if task_id == 14:
+                if task_id == COMMENT_TASK_ID:
                     if task.get('status') == 3:
                         print("  评论任务已完成，无需再次评论")
                         return True
                     break
 
-    # 检查手机绑定：优先使用API登录返回的bind_phone
     if bind_phone is not None:
         phone_bound = bind_phone and str(bind_phone) not in ['0', '', 'None', 'False']
         print(f"使用API登录返回的手机号: bind_phone={mask_phone(bind_phone)}")
@@ -250,10 +278,14 @@ def post_daily_comment(cookie_str, bind_phone=None):
                 print(f"  无近期评论记录")
 
         max_comic_attempts = 10
-        for comic_attempt in range(max_comic_attempts):
-            comic_id = str(random.randint(4, 86783))
+        comic_candidates = get_comment_comic_candidates(
+            cookie_str,
+            user_level,
+            max_comic_attempts,
+        )
 
-            print(f"随机选择漫画ID: {comic_id} (尝试 {comic_attempt + 1}/{max_comic_attempts})")
+        for comic_attempt, comic_id in enumerate(comic_candidates, 1):
+            print(f"随机选择漫画ID: {comic_id} (尝试 {comic_attempt}/{len(comic_candidates)})")
             print(f"  漫画详情页: https://m.zaimanhua.com/pages/comic/detail?id={comic_id}")
 
             if uid and check_user_commented(token, comic_id, uid):
@@ -263,7 +295,7 @@ def post_daily_comment(cookie_str, bind_phone=None):
             comment_text = pick_unique_comment(recent_comments)
             print(f"发送评论: {comment_text}")
 
-            success, result = send_comment_api(token, comic_id, comment_text)
+            success, result = send_comment_api(token, comic_id, comment_text, cookie_str)
             if success:
                 print(f"  评论发送成功！")
                 return True
@@ -281,12 +313,7 @@ def post_daily_comment(cookie_str, bind_phone=None):
 
 
 def check_comment_task_status(token):
-    """检查评论任务（每日一评）状态
-
-    返回:
-        - status: 1=未完成, 2=可领取, 3=已完成
-        - task_id: 任务ID
-    """
+    # 状态：1 未完成，2 可领取，3 已完成
     try:
         task_result = get_task_list(token)
         if task_result and task_result.get('errno') == 0:
@@ -294,7 +321,7 @@ def check_comment_task_status(token):
             for task in tasks:
                 task_id = task.get('id') or task.get('taskId')
                 task_name = task.get('title') or task.get('name') or task.get('taskName', '')
-                is_comment_task = (task_id == 14 or
+                is_comment_task = (task_id == COMMENT_TASK_ID or
                                  '评论' in str(task_name) or
                                  '一评' in str(task_name))
                 if is_comment_task:
@@ -308,17 +335,10 @@ def check_comment_task_status(token):
 
 
 def run_comment(cookie_str, bind_phone=None):
-    """执行评论任务（API直接发送版本）
-
-    Args:
-        cookie_str: Cookie字符串
-        bind_phone: 从API登录响应获取的绑定手机号（可选）
-    """
     try:
-        # 发表评论
         comment_result = post_daily_comment(cookie_str, bind_phone=bind_phone)
 
-        # 未绑定手机号 → 跳过评论任务，不计为失败
+        # 未绑定手机号时不计失败
         if comment_result == COMMENT_SKIPPED:
             return {
                 'comment': None,
@@ -328,7 +348,6 @@ def run_comment(cookie_str, bind_phone=None):
 
         claim_result = claim_rewards(cookie_str)
 
-        # 检查评论任务是否真正完成（status=2或3）
         user_info = extract_user_info_from_cookies(cookie_str)
         token = user_info.get('token') if isinstance(user_info, dict) else None
 
@@ -350,7 +369,6 @@ def run_comment(cookie_str, bind_phone=None):
                 elif status == 1:
                     if verify_attempt < max_verify_retries - 1:
                         print(f"  [!] 评论任务未完成 (status=1)，可能评论未发送成功，准备重新评论...")
-                        # 重新发表评论
                         comment_result = post_daily_comment(cookie_str, bind_phone=bind_phone)
                         if comment_result:
                             print(f"  [v] 重新评论完成，等待服务器同步...")
@@ -376,7 +394,6 @@ def run_comment(cookie_str, bind_phone=None):
 
 
 def main():
-    """主函数，支持多账号"""
     cookies_list = get_all_cookies()
 
     if not cookies_list:
@@ -392,8 +409,6 @@ def main():
         print(f"正在执行评论任务: {name}")
         print('='*50)
 
-        # 验证 Cookie 有效性，如果失效尝试自动登录
-        # 使用对应的账号索引获取对应的多账号凭据
         from auto_login import get_valid_cookie
         valid_cookie, is_auto_login = get_valid_cookie(cookie_str, name, account_index=index if index > 0 else None)
 
@@ -408,7 +423,6 @@ def main():
         else:
             print(f"  [v] 使用配置的Cookie")
 
-        # 从Cookie中提取bind_phone用于评论任务验证
         bind_phone = None
         user_info = extract_user_info_from_cookies(cookie_str)
         if isinstance(user_info, dict):
