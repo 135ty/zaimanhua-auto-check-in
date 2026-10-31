@@ -55,10 +55,22 @@ def login_and_get_cookie(username, password, account_label=""):
     try:
         pwd_md5 = hashlib.md5(password.encode()).hexdigest()
 
+        client_id = ""
+        try:
+            config_resp = requests.get(
+                "https://v4api.zaimanhua.com/app/v1/config/common",
+                timeout=10,
+            )
+            client_id = config_resp.json().get("data", {}).get("data", {}).get("clientId", "")
+        except Exception:
+            pass
+
         data = {
             "username": username,
             "passwd": pwd_md5,
         }
+        if client_id:
+            data["uuid"] = client_id
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
         }

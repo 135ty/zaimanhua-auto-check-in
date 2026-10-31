@@ -1,6 +1,6 @@
 # Zaimanhua Auto Check-in
 
-基于 [ZAI_X](https://github.com/Fusn126/ZAI_X) 接口的再漫画 (zaimanhua.com) 每日任务自动化工具，使用 GitHub Actions 运行。
+再漫画 (zaimanhua.com) 每日任务自动化工具。
 
 ## 功能特性
 
@@ -22,11 +22,11 @@
 
 | 功能 | 对应工作流 | 说明 |
 |-----|-----------|------|
-| 国庆七天乐抽奖必得vip会员 | National Day Lottery | 自动完成分享/阅读/评论任务并抽奖 |
+| 万圣节活动抽奖 | Halloween Lottery | 自动完成分享/阅读/评论任务并抽奖 |
 
-> 活动页面: https://activity.zaimanhua.com/national-day-2026/
+> 活动页面: https://activity.zaimanhua.com/halloween-2026/
 >
-> 活动截止: 北京时间 2026-10-07 24:00
+> 活动截止: 北京时间 2026-11-01 24:00
 
 ## 配置 GitHub Secret
 
